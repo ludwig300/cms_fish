@@ -13,7 +13,28 @@ from telegram.ext import (CallbackContext, CallbackQueryHandler,
 
 logging.basicConfig(level=logging.INFO)
 
-_database = None
+
+class RedisConnection:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(RedisConnection, cls).__new__(cls, *args, **kwargs)
+            cls._instance.init_redis()
+        return cls._instance
+
+    def init_redis(self):
+        database_password = os.getenv("DATABASE_PASSWORD")
+        database_host = os.getenv("DATABASE_HOST", "localhost")
+        database_port = int(os.getenv("DATABASE_PORT", 6379))
+
+        pool = redis.ConnectionPool(
+            host=database_host,
+            port=database_port,
+            password=database_password,
+            db=0
+        )
+        self.connection = redis.Redis(connection_pool=pool)
 
 
 def start(update: Update, context: CallbackContext) -> None:
@@ -53,7 +74,11 @@ def handle_menu(update: Update, context: CallbackContext) -> None:
     image = requests.get(f'http://localhost:{port}{image_url}').content
     image_stream = BytesIO(image)
     keyboard = [
-        [InlineKeyboardButton("Добавить в корзину", callback_data=f"add_to_cart_{product['id']}")],
+        [InlineKeyboardButton(
+            "Добавить в корзину",
+            callback_data=f"add_to_cart_{product['id']}"
+            )
+        ],
         [InlineKeyboardButton("Назад", callback_data='BACK_TO_MENU')]
         ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -67,7 +92,10 @@ def handle_menu(update: Update, context: CallbackContext) -> None:
     )
 
     # Удаление старого сообщения
-    context.bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
 
     return 'HANDLE_DESCRIPTION'
 
@@ -77,7 +105,10 @@ def handle_description(update: Update, context: CallbackContext) -> str:
     query = update.callback_query
     query.answer()
 
-    context.bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
 
     start(update, context)
 
@@ -86,21 +117,38 @@ def handle_description(update: Update, context: CallbackContext) -> str:
 
 def add_to_cart(product_id, chat_id):
     logger.info(f'add_to_cart, chat_id={chat_id} product_id={product_id}')
-    cart_data = {
-        "data": {
-            "TelegramUserID": str(chat_id),
-        }
-    }
-    pprint(cart_data)
     headers = {'Authorization': f'Bearer {strapi_api_token}'}
-    response = requests.post("http://localhost:1338/api/carts", json=cart_data, headers=headers)
-    logger.info(f'{response.status_code}')
-    if response.status_code == 200:
-        cart_id = response.json().get("data").get("id")
-        logger.info(f"Товар {product_id} успешно добавлен в корзину пользователя {chat_id}.")
-        return cart_id
+    db = RedisConnection().connection
+
+    # Проверка существующей корзины в Redis
+    cart_id = db.get(f"cart_id_{chat_id}")
+    if cart_id:
+        cart_id = cart_id.decode("utf-8")
     else:
-        logger.info(f"Не удалось добавить товар в корзину. Ошибка: {response.content}")
+        # Если корзина не существует, создайте новую в вашей основной базе данных и сохраните cart_id в Redis
+        cart_data = {
+            "data": {
+                "TelegramUserID": str(chat_id),
+            }
+        }
+        pprint(cart_data)
+        response = requests.post(
+            "http://localhost:1338/api/carts",
+            json=cart_data,
+            headers=headers
+        )
+
+        if response.status_code != 200:
+            logger.info(f"Failed to create cart. Error: {response.content}")
+            return None
+
+        cart_id = response.json().get("data").get("id")
+        logger.info(f"New cart created with id: {cart_id}")
+
+        # Сохранение cart_id в Redis
+        db.set(f"cart_id_{chat_id}", cart_id)
+
+    return cart_id
 
 
 def add_product_to_cart(cart_id, product_id, quantity=1):
@@ -113,11 +161,43 @@ def add_product_to_cart(cart_id, product_id, quantity=1):
         "quantity": quantity
     }
     headers = {'Authorization': f'Bearer {strapi_api_token}'}
-    response = requests.post("http://localhost:1338/api/cart-products", json={"data": cart_product_data}, headers=headers)
+    response = requests.post(
+        "http://localhost:1338/api/cart-products",
+        json={"data": cart_product_data},
+        headers=headers
+    )
     if response.status_code == 200:
         logger.info(f"Товар {product_id} успешно добавлен в корзину {cart_id}.")
     else:
         logger.info(f"Не удалось добавить товар в корзину. Ошибка: {response.content}")
+
+
+def add_to_temp_storage(chat_id, product_id, quantity=1):
+    db = RedisConnection().connection
+    temp_cart = db.get(f"temp_cart_{chat_id}")
+    if temp_cart is None:
+        temp_cart = {}
+    else:
+        temp_cart = eval(temp_cart.decode('utf-8'))
+
+    if product_id in temp_cart:
+        temp_cart[product_id] += quantity
+    else:
+        temp_cart[product_id] = quantity
+
+    db.set(f"temp_cart_{chat_id}", str(temp_cart))
+
+
+def confirm_cart(chat_id):
+    db = RedisConnection().connection
+    temp_cart = db.get(f"temp_cart_{chat_id}")
+    if temp_cart is not None:
+        temp_cart = eval(temp_cart.decode('utf-8'))
+        cart_id = add_to_cart(None, chat_id)
+        for product_id, quantity in temp_cart.items():
+            add_product_to_cart(cart_id, product_id, quantity)
+
+        db.delete(f"temp_cart_{chat_id}")
 
 
 def handle_users_reply(update, context):
@@ -134,7 +214,7 @@ def handle_users_reply(update, context):
     Если пользователь захочет начать общение с ботом заново, он также может воспользоваться этой командой.
     """
     logger.info('handle_users_reply')
-    db = get_database_connection()
+    db = RedisConnection().connection
     if update.message:
         user_reply = update.message.text
         logger.info(f'user_reply={user_reply}')
@@ -147,7 +227,10 @@ def handle_users_reply(update, context):
             product_id = user_reply.split("_")[-1]
             logger.info('Добавляю в бд')
             cart_id = add_to_cart(product_id, chat_id)
-            add_product_to_cart(cart_id, product_id)
+            if cart_id is not None:
+                add_product_to_cart(cart_id, product_id)
+            else:
+                logger.error("Ошибка при добавлении в корзину: cart_id is None")
 
     else:
         return
@@ -177,21 +260,8 @@ def handle_users_reply(update, context):
         print('Ошибка', err)
 
 
-def get_database_connection():
-    """
-    Возвращает конекшн с базой данных Redis, либо создаёт новый, если он ещё не создан.
-    """
-    global _database
-    if _database is None:
-        database_password = os.getenv("DATABASE_PASSWORD")
-        database_host = os.getenv("DATABASE_HOST")
-        database_port = os.getenv("DATABASE_PORT")
-        _database = redis.Redis(host=database_host, port=database_port, password=database_password)
-    return _database
-
-
 def get_products(port, strapi_api_token):
-    db = get_database_connection()
+    db = RedisConnection().connection
     cache_key = "products_list"
     cached_data = db.get(cache_key)
 
@@ -210,7 +280,8 @@ def get_products(port, strapi_api_token):
 
 def get_product_detail(product_id):
     cache_key = f"product_detail_{product_id}"
-    cached_data = _database.get(cache_key)
+    db = RedisConnection().connection
+    cached_data = db.get(cache_key)
 
     if cached_data:
         return json.loads(cached_data.decode("utf-8"))
@@ -222,7 +293,7 @@ def get_product_detail(product_id):
     response.raise_for_status()
     response_json = response.json()['data']
 
-    _database.setex(cache_key, 3600, json.dumps(response_json))
+    db.setex(cache_key, 3600, json.dumps(response_json))
 
     return response_json
 
