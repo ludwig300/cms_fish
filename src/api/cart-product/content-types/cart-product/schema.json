@@ -14,8 +14,9 @@
   "attributes": {
     "product": {
       "type": "relation",
-      "relation": "oneToOne",
-      "target": "api::product.product"
+      "relation": "manyToOne",
+      "target": "api::product.product",
+      "inversedBy": "cart_products"
     },
     "cart": {
       "type": "relation",

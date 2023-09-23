@@ -45,8 +45,15 @@ def start(update: Update, context: CallbackContext) -> None:
     products = context.bot_data.get('products', [])
     keyboard = list()
     for product in products:
-        button = [InlineKeyboardButton(product['attributes']['title'], callback_data=product['id'])]
+        button = [
+            InlineKeyboardButton(
+                product['attributes']['title'],
+                callback_data=product['id']
+            )
+        ]
         keyboard.append(button)
+    keyboard.append([InlineKeyboardButton("Моя корзина", callback_data="SHOW_CART")])
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     message.reply_text('Please choose:', reply_markup=reply_markup)
@@ -76,11 +83,10 @@ def handle_menu(update: Update, context: CallbackContext) -> None:
     keyboard = [
         [InlineKeyboardButton(
             "Добавить в корзину",
-            callback_data=f"add_to_cart_{product['id']}"
-            )
-        ],
+            callback_data=f"add_to_cart_{product['id']}")],
+        [InlineKeyboardButton("Моя корзина", callback_data="SHOW_CART")],
         [InlineKeyboardButton("Назад", callback_data='BACK_TO_MENU')]
-        ]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = f"{product['attributes']['title']}:\n\n{product['attributes']['description']}"
@@ -125,7 +131,6 @@ def add_to_cart(product_id, chat_id):
     if cart_id:
         cart_id = cart_id.decode("utf-8")
     else:
-        # Если корзина не существует, создайте новую в вашей основной базе данных и сохраните cart_id в Redis
         cart_data = {
             "data": {
                 "TelegramUserID": str(chat_id),
@@ -152,6 +157,7 @@ def add_to_cart(product_id, chat_id):
 
 
 def add_product_to_cart(cart_id, product_id, quantity=1):
+    logger.info(f'add_product_to_cart, cart_id={cart_id} product_id={product_id}')
     if cart_id is None:
         logger.info("Не удалось добавить товар в корзину: cart_id is None.")
         return
@@ -173,6 +179,7 @@ def add_product_to_cart(cart_id, product_id, quantity=1):
 
 
 def add_to_temp_storage(chat_id, product_id, quantity=1):
+    logger.info(f'add_to_temp_storage, chat_id={chat_id} product_id={product_id}')
     db = RedisConnection().connection
     temp_cart = db.get(f"temp_cart_{chat_id}")
     if temp_cart is None:
@@ -189,6 +196,7 @@ def add_to_temp_storage(chat_id, product_id, quantity=1):
 
 
 def confirm_cart(chat_id):
+    logger.info(f'confirm_cart, chat_id={chat_id}')
     db = RedisConnection().connection
     temp_cart = db.get(f"temp_cart_{chat_id}")
     if temp_cart is not None:
@@ -201,18 +209,6 @@ def confirm_cart(chat_id):
 
 
 def handle_users_reply(update, context):
-    """
-    Функция, которая запускается при любом сообщении от пользователя и решает как его обработать.
-    Эта функция запускается в ответ на эти действия пользователя:
-        * Нажатие на inline-кнопку в боте
-        * Отправка сообщения боту
-        * Отправка команды боту
-    Она получает стейт пользователя из базы данных и запускает соответствующую функцию-обработчик (хэндлер).
-    Функция-обработчик возвращает следующее состояние, которое записывается в базу данных.
-    Если пользователь только начал пользоваться ботом, Telegram форсит его написать "/start",
-    поэтому по этой фразе выставляется стартовое состояние.
-    Если пользователь захочет начать общение с ботом заново, он также может воспользоваться этой командой.
-    """
     logger.info('handle_users_reply')
     db = RedisConnection().connection
     if update.message:
@@ -236,13 +232,16 @@ def handle_users_reply(update, context):
         return
     if user_reply == '/start':
         user_state = 'START'
+    elif user_reply == 'SHOW_CART':
+        user_state = 'SHOW_CART'
     else:
         user_state = db.get(chat_id).decode("utf-8")
 
     states_functions = {
         'START': start,
         'HANDLE_MENU': handle_menu,
-        'HANDLE_DESCRIPTION': handle_description
+        'HANDLE_DESCRIPTION': handle_description,
+        'SHOW_CART': show_cart
 
     }
     if user_state in states_functions:
@@ -261,6 +260,7 @@ def handle_users_reply(update, context):
 
 
 def get_products(port, strapi_api_token):
+    logger.info('get_products')
     db = RedisConnection().connection
     cache_key = "products_list"
     cached_data = db.get(cache_key)
@@ -279,6 +279,7 @@ def get_products(port, strapi_api_token):
 
 
 def get_product_detail(product_id):
+    logger.info('get_product_detail')
     cache_key = f"product_detail_{product_id}"
     db = RedisConnection().connection
     cached_data = db.get(cache_key)
@@ -296,6 +297,48 @@ def get_product_detail(product_id):
     db.setex(cache_key, 3600, json.dumps(response_json))
 
     return response_json
+
+
+def get_cart_contents(cart_id):
+    logger.info('get_cart_contents')
+    headers = {'Authorization': f'Bearer {strapi_api_token}'}
+    payload = {'populate': 'cart_products.product'}
+    response = requests.get(
+        f'http://localhost:1338/api/carts/{cart_id}',
+        headers=headers,
+        params=payload
+    )
+    logger.info(f'response.status_code = {response.status_code}')
+    if response.status_code != 200:
+        logger.info(f"Failed to fetch cart contents. Error: {response.content}")
+        return None
+    cart_contents = response.json()["data"]["attributes"]["cart_products"]["data"]
+    return cart_contents
+
+
+def show_cart(update: Update, context: CallbackContext):
+    logger.info('show_cart')
+    db = RedisConnection().connection
+    chat_id = update.message.chat_id if update.message else update.callback_query.message.chat_id
+    cart_id = db.get(f"cart_id_{chat_id}")
+
+    if cart_id:
+        cart_id = cart_id.decode("utf-8")
+        logger.info(f'cart_id = {cart_id}')
+        cart_contents = get_cart_contents(cart_id)
+        # logger.info(f'cart_contents = {cart_contents}')
+        if cart_contents:
+            cart_text = "В вашей корзине:\n"
+            for cart_content in cart_contents:
+                product_id = cart_content["attributes"]["product"]["data"]["id"]
+                product_detail = get_product_detail(product_id)
+                cart_text += f"{product_detail['attributes']['title']}, цена: {product_detail['attributes']['price']}, количество: {cart_content['attributes']['quantity']}\n"
+            context.bot.send_message(chat_id=chat_id, text=cart_text)
+        else:
+            context.bot.send_message(chat_id=chat_id, text="Ваша корзина пуста.")
+    else:
+        context.bot.send_message(chat_id=chat_id, text="Ваша корзина пуста.")
+    return 'HANDLE_MENU'
 
 
 if __name__ == '__main__':

@@ -67,7 +67,7 @@
       "type": "relation",
       "relation": "oneToOne",
       "target": "api::cart.cart",
-      "inversedBy": "users_permissions_user"
+      "mappedBy": "users_permissions_user"
     }
   }
 }
