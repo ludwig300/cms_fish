@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from io import BytesIO
-from pprint import pprint
 
 import redis
 import requests
@@ -60,14 +59,6 @@ def start(update: Update, context: CallbackContext) -> None:
     return 'HANDLE_MENU'
 
 
-def button(update: Update, context: CallbackContext) -> None:
-    logger.info('button')
-    """Parses the CallbackQuery and updates the message text."""
-    query = update.callback_query
-    query.answer()
-    query.edit_message_text(text=f"Selected option: {query.data}")
-
-
 def handle_menu(update: Update, context: CallbackContext) -> None:
     logger.info('handle_menu')
     query = update.callback_query
@@ -80,13 +71,9 @@ def handle_menu(update: Update, context: CallbackContext) -> None:
     image_url = product['attributes']['picture']['data']['attributes']['url']
     image = requests.get(f'http://localhost:{port}{image_url}').content
     image_stream = BytesIO(image)
-    keyboard = [
-        [InlineKeyboardButton(
-            "Добавить в корзину",
-            callback_data=f"add_to_cart_{product['id']}")],
-        [InlineKeyboardButton("Моя корзина", callback_data="SHOW_CART")],
-        [InlineKeyboardButton("Назад", callback_data='BACK_TO_MENU')]
-    ]
+    default_quantity = 1
+
+    keyboard = generate_keyboard(product_id, default_quantity)
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     text = f"{product['attributes']['title']}:\n\n{product['attributes']['description']}"
@@ -106,23 +93,42 @@ def handle_menu(update: Update, context: CallbackContext) -> None:
     return 'HANDLE_DESCRIPTION'
 
 
-def handle_description(update: Update, context: CallbackContext) -> str:
-    logger.info('handle_description')
+def handle_description(context: CallbackContext, update: Update):
     query = update.callback_query
-    query.answer()
+    logger.info(f'handle_description {context.bot_data}')
+    if query.data == 'BACK_TO_MENU':
+        start(context, update)
+        context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=query.message.message_id
+        )
+        return 'HANDLE_MENU'
+    elif query.data == 'SHOW_CART':
+        show_cart(context, update)
+        return 'HANDLE_CART'
+    else:
+        access_token = context.bot_data.get('access_token')
+        user_id = query.from_user.id
+        product_id = context.user_data.get('product_id')
+        name = context.user_data.get('name')
+        quantity = int(query.data)
+        add_product_to_cart(access_token, user_id, product_id, quantity)
+        keyboard = generate_keyboard(product_id, quantity)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f'{quantity} pcs {name} added to cart',
+            reply_markup=reply_markup
+        )
+        context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=query.message.message_id
+        )
+        return 'HANDLE_DESCRIPTION'
 
-    context.bot.delete_message(
-        chat_id=query.message.chat_id,
-        message_id=query.message.message_id
-    )
 
-    start(update, context)
-
-    return 'HANDLE_MENU'
-
-
-def add_to_cart(product_id, chat_id):
-    logger.info(f'add_to_cart, chat_id={chat_id} product_id={product_id}')
+def add_to_cart(product_id, chat_id, quantity=1):
+    logger.info(f'add_to_cart, chat_id={chat_id} product_id={product_id} quantity={quantity}')
     headers = {'Authorization': f'Bearer {strapi_api_token}'}
     db = RedisConnection().connection
 
@@ -136,7 +142,6 @@ def add_to_cart(product_id, chat_id):
                 "TelegramUserID": str(chat_id),
             }
         }
-        pprint(cart_data)
         response = requests.post(
             "http://localhost:1338/api/carts",
             json=cart_data,
@@ -152,6 +157,9 @@ def add_to_cart(product_id, chat_id):
 
         # Сохранение cart_id в Redis
         db.set(f"cart_id_{chat_id}", cart_id)
+
+    # Здесь мы добавляем товар в корзину с учетом количества
+    add_product_to_cart(cart_id, product_id, quantity)
 
     return cart_id
 
@@ -178,34 +186,19 @@ def add_product_to_cart(cart_id, product_id, quantity=1):
         logger.info(f"Не удалось добавить товар в корзину. Ошибка: {response.content}")
 
 
-def add_to_temp_storage(chat_id, product_id, quantity=1):
-    logger.info(f'add_to_temp_storage, chat_id={chat_id} product_id={product_id}')
-    db = RedisConnection().connection
-    temp_cart = db.get(f"temp_cart_{chat_id}")
-    if temp_cart is None:
-        temp_cart = {}
-    else:
-        temp_cart = eval(temp_cart.decode('utf-8'))
-
-    if product_id in temp_cart:
-        temp_cart[product_id] += quantity
-    else:
-        temp_cart[product_id] = quantity
-
-    db.set(f"temp_cart_{chat_id}", str(temp_cart))
-
-
-def confirm_cart(chat_id):
-    logger.info(f'confirm_cart, chat_id={chat_id}')
-    db = RedisConnection().connection
-    temp_cart = db.get(f"temp_cart_{chat_id}")
-    if temp_cart is not None:
-        temp_cart = eval(temp_cart.decode('utf-8'))
-        cart_id = add_to_cart(None, chat_id)
-        for product_id, quantity in temp_cart.items():
-            add_product_to_cart(cart_id, product_id, quantity)
-
-        db.delete(f"temp_cart_{chat_id}")
+def generate_keyboard(product_id, current_quantity):
+    return [
+        [
+            InlineKeyboardButton("-", callback_data=f"decrease_{product_id}"),
+            InlineKeyboardButton(str(current_quantity), callback_data=f"quantity_{product_id}"),
+            InlineKeyboardButton("+", callback_data=f"increase_{product_id}")
+        ],
+        [
+            InlineKeyboardButton("Добавить в корзину", callback_data=f"add_to_cart_{product_id}")
+        ],
+        [InlineKeyboardButton("Моя корзина", callback_data="SHOW_CART")],
+        [InlineKeyboardButton("Назад", callback_data='BACK_TO_MENU')]
+    ]
 
 
 def handle_users_reply(update, context):
@@ -217,19 +210,47 @@ def handle_users_reply(update, context):
         chat_id = update.message.chat_id
     elif update.callback_query:
         user_reply = update.callback_query.data
-        logger.info(f'user_reply callback_query= {user_reply}')
         chat_id = update.callback_query.message.chat_id
+        query = update.callback_query
+
+        if "increase_" in user_reply:
+            product_id = user_reply.split("_")[1]
+            # Получаем текущее количество
+            key = f"quantity_{product_id}"
+            current_quantity = context.user_data.get(key, 1)
+
+            # Увеличиваем количество
+            current_quantity += 1
+            context.user_data[key] = current_quantity
+             # Обновляем клавиатуру
+            keyboard = generate_keyboard(product_id, current_quantity)
+            query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif "decrease_" in user_reply:
+            product_id = user_reply.split("_")[1]
+            # Получаем текущее количество
+            key = f"quantity_{product_id}"
+            current_quantity = context.user_data.get(key, 1)
+
+            # Уменьшаем количество (но не меньше 1)
+            current_quantity = max(1, current_quantity - 1)
+            context.user_data[key] = current_quantity
+
+            # Обновляем клавиатуру
+            keyboard = generate_keyboard(product_id, current_quantity)
+            query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
         if "add_to_cart_" in user_reply:
             product_id = user_reply.split("_")[-1]
             logger.info('Добавляю в бд')
-            cart_id = add_to_cart(product_id, chat_id)
-            if cart_id is not None:
-                add_product_to_cart(cart_id, product_id)
-            else:
+            key = f"quantity_{product_id}"
+            current_quantity = context.user_data.get(key, 1)
+            cart_id = add_to_cart(product_id, chat_id, current_quantity)
+            if cart_id is None:
                 logger.error("Ошибка при добавлении в корзину: cart_id is None")
-
     else:
         return
+
     if user_reply == '/start':
         user_state = 'START'
     elif user_reply == 'SHOW_CART':
@@ -242,19 +263,17 @@ def handle_users_reply(update, context):
         'HANDLE_MENU': handle_menu,
         'HANDLE_DESCRIPTION': handle_description,
         'SHOW_CART': show_cart
-
     }
     if user_state in states_functions:
         state_handler = states_functions[user_state]
     else:
         logger.error(f"Неизвестный user_state: {user_state}")
         return
-    # Если вы вдруг не заметите, что python-telegram-bot перехватывает ошибки.
-    # Оставляю этот try...except, чтобы код не падал молча.
-    # Этот фрагмент можно переписать.
+
     try:
         next_state = state_handler(update, context)
-        db.set(chat_id, next_state)
+        if not ("increase_" in user_reply or "decrease_" in user_reply):
+            db.set(chat_id, next_state)
     except Exception as err:
         print('Ошибка', err)
 
@@ -326,7 +345,6 @@ def show_cart(update: Update, context: CallbackContext):
         cart_id = cart_id.decode("utf-8")
         logger.info(f'cart_id = {cart_id}')
         cart_contents = get_cart_contents(cart_id)
-        # logger.info(f'cart_contents = {cart_contents}')
         if cart_contents:
             cart_text = "В вашей корзине:\n"
             for cart_content in cart_contents:
